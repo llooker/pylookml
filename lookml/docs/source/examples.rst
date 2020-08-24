@@ -75,7 +75,7 @@ Or do the same thing from any other git service (as long as you have SSH git acc
    ${order_items.cohort_by}
    ${order_items.metric}
 
-* check all of the children / decendants of a field
+* check all of the children / descendants of a field
 
 .. code-block:: python
    :linenos:

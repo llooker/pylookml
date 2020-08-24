@@ -9,6 +9,7 @@
    introduction
    examples
    eav
+   dependency_graphing
    reference
 
 

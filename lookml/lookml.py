@@ -6,10 +6,11 @@ import base64
 import requests
 import time, copy
 from string import Template
-import subprocess, os, platform
- 
+import subprocess, platform
+from graphviz import Digraph
+
 ######### V3 #########
-# TODO: implement length of field to be the number of it's properties (will help with formatting. Dense lookml when only one prop)
+# TODO: implement length of field to be the number of its properties (will help with formatting. Dense lookml when only one prop)
 # DONE: Complete shell git implementation.... iterate over files etc
 # DONE: Extends bug --> render issue
 # DONE: figure out the whole NDT thing
@@ -24,7 +25,10 @@ import subprocess, os, platform
 # TODO: Implement remaining collections iteration, top level file attributes (data groups, named value format etc)
 # TODO: ensure the top level stuff for file works, i.e. accessors for plurals like data groups etc
 
-# Dependency Graphing:
+# Dependency Graphing: #TODO:TP 
+    # TODO: Better conflict resolution when there are multiple matches for an object
+        # Ideally we would trace the import paths to see which objects are legally referenceable
+        # Currently this is from user input (predicting an eventual CLI interface)
     # TODO: Ancenstor functions? 
     # TODO: Child function support renaming across all properties (html, links, etc)
     # TODO: Multi-generation dependency tracing (ancestor / decendangt)
@@ -46,14 +50,13 @@ import subprocess, os, platform
 # TODO: Implement MVC? 
         # * model -> could eliminate the "phanton property" in that a class instance is only created on get / observation.... (getters and setters should mutate the underlying json at all times to ensure conssistency)
         # TODO: Rationalize View rendering
-        # TODO: elimnate property / properties classes? -> replace with model? Think through getter / setter / render 
-# TODO: Integrate Tom's script for dependency graphing OO
+        # TODO: eliminate property / properties classes? -> replace with model? Think through getter / setter / render 
 # TODO: Common Sql Functions added to the SQL paramter
 # TODO: Common html Functions added to the html paramter
 # TODO: Manifest
-# TODO: contants
-# TODO: locale
-# TODO: slots / performance optimizaiton
+# TODO: Constants
+# TODO: Locale
+# TODO: Slots / performance optimizaiton
 # TODO: Interactive CLI
 # TODO: Update LKML to support new filters syntax
 # TODO: additional documentation
@@ -149,6 +152,160 @@ class project:
                 self.looker_host = self.looker_host + '/'
         self.deploy_url = ""
         self.constructDeployUrl()
+        
+        # Create an internal representation of all objects for looking up by name
+        self.name_to_obj_mapping = {}
+
+    def generate_map(self):
+        '''This generates an internal representation of the LookML objects 
+        within the project. Once finished, it prompts all of the objects to
+        generate interdependencies between themselves.
+
+        This creates an attribute called ``name_to_obj_mapping`` which is a 
+        Dict with keys that are LookML object names and values that are Dicts
+        containing references to the python objects, separated into views and
+        explores::
+            {
+                lookml_obj_1: {
+                    view: [id] # No explores with this name
+                    },
+                lookml_obj_2: {
+                    view: [id, id], # Multiple views with this name
+                    explore: [id]
+                    }
+            }
+        '''
+        for file in self.files():
+            for v in file.vws:
+                if self.name_to_obj_mapping.get(v.name):
+                    if self.name_to_obj_mapping[v.name].get('view'):
+                        self.name_to_obj_mapping[v.name]['view'].append(v)
+                    else:
+                        self.name_to_obj_mapping[v.name]['view'] = [v]
+                else:
+                    self.name_to_obj_mapping[v.name] = {'view': [v]}
+            for ex in file.explores:
+                if self.name_to_obj_mapping.get(ex.name):
+                    if self.name_to_obj_mapping[ex.name].get('explore'):
+                        self.name_to_obj_mapping[ex.name]['explore'].append(ex)
+                    else:
+                        self.name_to_obj_mapping[ex.name]['explore'] = [ex]
+                else:
+                    self.name_to_obj_mapping[ex.name] = {'explore': [ex]}
+        # Now make links between all objects
+        for matches in self.name_to_obj_mapping.values():
+            for target in matches.values():
+                for lookml_object in target:
+                    lookml_object.make_links(self)
+
+    def locate_obj_by_name(self,
+                           name,
+                           obj_type='view',
+                           first=False):
+        '''
+        Pass an LookML object name and this returns the python object that 
+        represents it. If multiple results are found then you can choose the
+        correct one by index, or use ``first=True`` to always return the first
+        result.
+
+        Note:
+            By default this will assume the object is a view but explores can
+            also be chosen using ``obj_type='explore'``.
+                
+        Args:
+            name (str): The name of the LookML object.
+            obj_type (str, optional): One of 'view' or 'explore'. Defaults to
+                'view'
+            first (bool. option): True to return the first match, False for the
+                user to choose based on index. Defaults to False.
+
+        Returns:
+            The matching python object corresponding to the LookML object name.
+        '''
+        if obj_type not in ('view', 'explore'):
+            raise ValueError("Lookup is only supported for views and explores")
+        if not self.name_to_obj_mapping.get(name):
+            return None # Nothing of this name in this project
+        if not self.name_to_obj_mapping[name].get(obj_type):
+            return None # No views/explores of this name in this project
+        results = self.name_to_obj_mapping[name][obj_type]
+        if len(results) > 1 and not first:
+            ## TODO:TP Must be a better way to do this than user input?
+            print("Multiple options found, please choose.")
+            for ix, obj in enumerate(results):
+                print(ix + 1, obj)
+            choice = input("Enter number:\n")
+            return results[choice - 1]
+        else:
+            return results[0]
+
+    #TODO:TP add option to name graph
+    def graph_dependencies(self,
+                           obj_name,
+                           obj_type,
+                           first=False,
+                           max_depth=conf.MAX_GRAPH_DEPTH):
+        '''
+        Pass in an object name and this will generate a chart of the downstream
+        dependencies and return a ``Digraph`` object which can be viewed or 
+        saved to PDF.
+
+        Args:
+            obj_name (str): The name of the LookML object with dependencies to 
+                graph.
+            obj_type (str): One of 'view' or 'explore'. Used to narrow down the
+                objects matching the name.
+            first (bool, optional): Defaults to False. True will return the
+                first matching object in the case that more than one share the
+                same name. False will print an enumerated list for the user to 
+                choose from. 
+            max_depth(int, optional): The max depth that dependencies will be
+                graphed to. By default this is set by the configuration file
+                ``conf.py``. Note that self-referential recursion is prevented
+                by default.
+
+        Returns:
+            A graphviz ``Digraph`` object representing the dependencies. This
+            can be saved as an image or PDF or interpreted by other tools.
+        '''
+        if self.name_to_obj_mapping == {}:
+            self.generate_map()
+        target = self.locate_obj_by_name(obj_name, obj_type=obj_type, first=first)
+        if target is not None:
+            return target.make_digraph(full_path=[], max_depth=max_depth)
+
+    #TODO:TP -> Option to filter orphan objects (no children)
+    #TODO:TP -> Show an ERD (with join relationships) rather than a dependency graph
+    def graph_all_dependencies(self, max_depth=conf.MAX_GRAPH_DEPTH):
+        '''
+        Generate a chart of all dependencies in the project, starting from
+        all view objects that do not depend on anything else.
+
+        Args:
+            max_depth(int, optional): The max depth that dependencies will be
+            graphed to. By default this is set by the configuration file
+            ``conf.py``. Note that self-referential recursion is prevented by 
+            default.
+
+        Returns:
+            A graphviz ``Digraph`` object representing the dependencies. This
+            can be saved as an image or PDF or interpreted by other tools.
+        '''
+        if self.name_to_obj_mapping == {}:
+            self.generate_map()
+        digraph = Digraph(engine=conf.GRAPH_ENGINE,
+                          name='graph')
+        digraph.attr(overlap='scale')
+        full_path=[]
+        for matches in self.name_to_obj_mapping.values():
+            for target in matches.values():
+                for lookml_object in target:
+                    if lookml_object.descriptive_type == 'view': # Views are the base here
+                        digraph = lookml_object.make_digraph(full_path=full_path,
+                                                             digraph=digraph,
+                                                             max_depth=max_depth,
+                                                             full_map=True)
+        return digraph
 
     def __getitem__(self, key):
         return self.file(key)
@@ -174,7 +331,7 @@ class project:
         :return: generator of LookML file objects
         :rtype: generator of lookml File objects
         '''
-        for f in self.repo.get_contents(path):
+        for f in  self.repo.get_contents(path):
             yield File(f)
 
     def file(self,path):
@@ -603,7 +760,7 @@ class File:
         def exploreBootstrap():
             #custom initialization for path type
             #Set Basic Attributes
-            self.name = f.name + '.model.lkml' # What about explore filetypes?
+            self.name = f.name + '.model.lkml' # TODO What about explore filetypes?
             self.base_name = f.name
             self.path = self.name
             self.sha = ''
@@ -847,6 +1004,85 @@ class base(object):
         '''
         return self.properties.rawPropValue(key)
 
+    # For LookML interdependence
+    def add_extension(self, ref):
+        """Add a link to an object that extends this one"""
+        self.extended_by.append(ref)
+        self.extended_by = list(set(self.extended_by))
+
+    def add_extend(self, ref):
+        """Add a link to an explore that this extends"""
+        self.extends.append(ref)
+        self.extends = list(set(self.extends))
+
+    # For Graphing dependencies
+    def make_digraph(self,
+                     parent=None,
+                     digraph=None,
+                     depth=0,
+                     style={},
+                     full_path=[], # Be careful with mutable default arguments!
+                     max_depth=conf.MAX_GRAPH_DEPTH,
+                     full_map=False):
+        """Produces a digraph dot diagram based on the current object and its downstream dependencies"""
+        if self.token not in ('view', 'explore'):
+            raise TypeError("Only views and explores are currently supported for graphing.")
+        colour = conf.GRAPH_COLOURS[self.descriptive_type]
+        if digraph is None:
+            digraph = Digraph(engine=conf.GRAPH_ENGINE,
+                              name='graph',
+                              node_attr={'style': 'filled', 'color': '#DF928E', 'shape': 'box'})
+            digraph.attr(overlap='scale')
+            digraph.node(str(id(self)), self.name)
+        elif full_map:
+            digraph.attr(overlap='scale')
+            digraph.attr('node', style='filled', color='#F2E6E6', shape='box')
+            digraph.node(str(id(self)), self.name)
+        else:
+            digraph.attr('edge', arrowhead=style['arrow'], color=style['arrow_color'])
+            digraph.attr('node', color=colour)
+            digraph.edge(parent, str(id(self)), label=style['label'])
+            digraph.node(str(id(self)), self.name)
+        if str(id(self)) in full_path or depth == max_depth:
+            return digraph
+        full_path.append(str(id(self)))
+        if self.extended_by != []:
+            for child in self.extended_by:
+                style = {'label': 'extension', 'arrow': 'none', 'arrow_color': 'lightgrey'}
+                digraph = child.make_digraph(parent=str(id(self)),
+                                             digraph=digraph,
+                                             depth=depth + 1,
+                                             style=style,
+                                             full_path=full_path,
+                                             max_depth=max_depth)
+        if self.ndt_references != [] and self.ndt_references is not None:
+            for child in self.ndt_references:
+                style = {'label': 'NDT', 'arrow': 'box', 'arrow_color': 'darkgrey'}
+                digraph = child.make_digraph(parent=str(id(self)),
+                                                digraph=digraph,
+                                                depth=depth+1,
+                                                style=style,
+                                                full_path=full_path,
+                                                max_depth=max_depth)
+        if self.explore_appearances != [] and self.explore_appearances is not None:
+            for child in self.explore_appearances:
+                style = {'label': 'explore', 'arrow': 'normal', 'arrow_color': 'darkgrey'}
+                digraph = child.make_digraph(parent=str(id(self)),
+                                                digraph=digraph,
+                                                depth=depth + 1,
+                                                style=style,
+                                                full_path=full_path,
+                                                max_depth=max_depth)
+        if self.dt_references != [] and self.dt_references is not None:
+            for child in self.dt_references:
+                style = {'label': 'DT', 'arrow': 'dot', 'arrow_color': 'darkgrey'}
+                digraph = child.make_digraph(parent=str(id(self)),
+                                                digraph=digraph,
+                                                depth=depth + 1,
+                                                style=style,
+                                                full_path=full_path,
+                                                max_depth=max_depth)
+        return digraph
 
     def __repr__(self):
         return "%s  name: %s id: %s" % (self.__class__, self.identifier, hex(id(self))) 
@@ -893,7 +1129,14 @@ class View(base):
         self.parent = None
         super(View, self).__init__(input)
         self.token = 'view'
-
+        # For LookML interdependence
+        self.descriptive_type = 'view' # Can be changed to NDT or DT. Used to colour code graphing
+        self.extends = []
+        self.extended_by = []
+        self.ndt_dependencies = [] # If it's an NDT, what's the explore source
+        self.dt_dependencies = [] # If it's a derived table, does it reference any sql table names
+        self.dt_references = [] # Where this view appears with SQL TABLE NAME
+        self.explore_appearances = [] # Where this is joined in to an explore
 
     def __str__(self):
         self.templateMap = {
@@ -958,7 +1201,6 @@ class View(base):
             pass
 
         super()._bind_lkml(jsonDict)
-
 
     def getFieldsSorted(self):
         '''
@@ -1154,7 +1396,7 @@ class View(base):
         '''
         get a field (most commonly, will pass in a field name)
 
-        :param field: Field to return 
+        :param field: Field to return
         :type field: str or Field (or Dimension, Measure...) object
         :return: Returns a subtype of Field
         :rtype:  Dimension, Measure, Filter or Parameter
@@ -1164,7 +1406,8 @@ class View(base):
             try:
                 return self._fields[f]
             except KeyError:
-                raise KeyError
+                # raise KeyError
+                return None #TODO see if this breaks something
         elif isinstance(f,Field):
             return self._fields[f.identifier]
 
@@ -1172,11 +1415,11 @@ class View(base):
         '''
         pass a regex expression and will return the fields whose sql match
 
-        :param prop: name of proprty you'd like to search
+        :param prop: name of property you'd like to search
         :param pattern: the regex pattern
         :type prop: str
-        :type patter: a regex search string
-        :return: a generator / iteratble set of fields who have a member property matching the pattern
+        :type pattern: a regex search string
+        :return: a generator / iterable set of fields who have a member property matching the pattern
         :rtype: Field
         '''
         if isinstance(pattern,list):
@@ -1185,7 +1428,6 @@ class View(base):
         for field in self.fields():
             if re.match(searchString,str(field.getProperty(prop))):
                 yield field
-
 
     def addField(self, field):
         '''
@@ -1250,8 +1492,8 @@ class View(base):
 
     def setPrimaryKey(self, f, callFromChild=False):
         '''
-        TODO: Complete Desctiption
-        represents a view onject in LookML
+        TODO: Complete Description
+        represents a view object in LookML
 
         :param arg1: description
         :param arg2: description
@@ -1277,7 +1519,7 @@ class View(base):
 
     def getPrimaryKey(self):
         '''
-        TODO: Complete Desctiption
+        TODO: Complete Description
         represents a view onject in LookML
 
         :param arg1: description
@@ -1293,7 +1535,7 @@ class View(base):
 
     def unSetPrimaryKey(self):
         '''
-        TODO: Complete Desctiption
+        TODO: Complete Description
         represents a view onject in LookML
 
         :param arg1: description
@@ -1491,6 +1733,57 @@ class View(base):
             self.children.update({child.identifier: child})
         return child
 
+    # For LookML interdependence
+    def add_ndt_dependency(self, ref):
+        """Add a link to an explore that this is based on"""
+        self.descriptive_type = 'ndt'
+        self.ndt_dependencies.append(ref)
+        self.ndt_dependencies = list(set(self.ndt_dependencies))
+
+    def add_dt_dependency(self, ref):
+        """Add a link to a view that this queries"""
+        self.descriptive_type = 'dt'
+        self.dt_dependencies.append(ref)
+        self.dt_dependencies = list(set(self.dt_dependencies)) 
+
+    def add_dt_reference(self, ref):
+        """Add a link to a view that references this one in SQL_TABLE_NAME"""
+        self.dt_references.append(ref)
+        self.dt_references = list(set(self.dt_references))
+    
+    def add_explore_appearance(self, ref):
+        """Add a link to an explore that this appears in"""
+        self.explore_appearances.append(ref)
+        self.explore_appearances = list(set(self.explore_appearances))
+
+    def make_links(self, project):
+        '''
+        Use a representation of the objects in a project and link this object to
+        others
+        '''
+        table_name_match = re.compile(r'\$\{([\w_]*?)\.SQL_TABLE_NAME\}')
+        # Extends
+        if self.hasProp('extends'):
+            for ex in self.properties.schema.get('extends'):
+                obj = project.locate_obj_by_name(ex, self.token, first=True)
+                if obj:
+                    self.add_extend(obj)
+                    obj.add_extension(self)
+        # Get any derived tables
+        if self.hasProp('derived_table'):
+            if self.properties.schema['derived_table'].get('explore_source'):
+                obj = project.locate_obj_by_name(self.properties.schema['derived_table']['explore_source']['name'], 'explore', first=True)
+                if obj:
+                    self.add_ndt_dependency(obj)
+                    obj.add_ndt_reference(self)
+            elif self.properties.schema['derived_table'].get('sql'):
+                table_names = re.findall(table_name_match, self.properties.schema['derived_table'].get('sql'))
+                for table in table_names:
+                    obj = project.locate_obj_by_name(table, 'view', first=True)
+                    if obj:
+                        self.add_dt_dependency(obj)
+                        obj.add_dt_reference(self)
+
 class Join(base):
     ''' Instantiates a LookML join object... '''
 
@@ -1551,7 +1844,12 @@ class Explore(base):
         self.base_view = ''
         super(Explore, self).__init__(input)
         self.token = 'explore'
-
+        # For LookML interdependence
+        self.extends = []
+        self.extended_by = []
+        self.descriptive_type = 'explore'
+        self.ndt_references = [] # Where this is referenced as an explore source in an NDT
+        self.views = [] # Views that appear in these explores (LookML objects)
             
     def _bind_lkml(self,jsonDict):
         if 'name' in jsonDict.keys():
@@ -1609,7 +1907,7 @@ class Explore(base):
 
     def createNDT(self,explore_source='', name='',fields=[]):
         pass
-        # TODO: re-impliment
+        # TODO: re-implement
         # if name:
         #     tmpView = View(name)
         # else:
@@ -1649,9 +1947,53 @@ class Explore(base):
     def getJoin(self, key):
         return self.joins.get(key, {})
 
+    # For LookML interdependence
+    def add_ndt_reference(self, ref):
+        """Add a view that references this explore in an NDT"""
+        self.ndt_references.append(ref)
+        self.ndt_references = list(set(self.ndt_references))
+
+    def add_view(self, ref):
+        """Add a view that this explore references"""
+        self.views.append(ref)
+        self.views = list(set(self.views))
+
+    def views_from_joins(self):
+        """Construct an array of lookml object names for the base table and all joins"""
+        self.view_names = []
+        if self.hasProp('from'):
+            self.view_names.append(self.getProperty('from').value)
+        elif self.hasProp('view_name'):
+            self.view_names.append(self.getProperty('view_name').value)
+        else:
+            self.view_names.append(self.name)
+        for k, v in self.joins.items():
+            if v.hasProp('from'):
+                self.view_names.append(v.getProperty('from').value)
+            else:
+                self.view_names.append(k)
+
+    def make_links(self, project):
+        '''
+        Use a representation of the objects in a project and link this object to
+        others
+        '''
+        self.views_from_joins()
+        if self.hasProp('extends'):
+            for ex in self.properties.schema.get('extends'):
+                obj = project.locate_obj_by_name(ex, self.token, first=True)
+                if obj:
+                    self.add_extend(obj)
+                    obj.add_extension(self)
+        for view in self.view_names:
+            obj = project.locate_obj_by_name(view, 'view', first=True)
+            if obj:
+                self.add_view(obj)
+                obj.add_explore_appearance(self)
+
 class Property(object):
     ''' A basic property / key value pair. 
-    If the value is a dict it will recusively instantiate properties within itself '''
+    If the value is a dict it will recursively instantiate properties within itself '''
     def __init__(self, name, value):
         self.name = name
         self.num = 0
@@ -1811,7 +2153,7 @@ class Property(object):
 
 class Properties(object):
     '''
-    Treats the collection of properties as a recursive dicitionary
+    Treats the collection of properties as a recursive dictionary
     Things that fall outside of uniqueness (special cases):
     includes, links, filters, bind_filters
     Things that should be their own class:
@@ -1983,7 +2325,6 @@ class Field(base):
         self.db_column = ''
         super(Field, self).__init__(input)
         self.templateMap = {
-
         }
 
     def children(self):
